@@ -10,7 +10,6 @@ credential or paid service is involved.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 
@@ -49,10 +48,18 @@ def RelayConfig_fields() -> set[str]:
 
 
 def build_world() -> tuple[Relayer, RelayRuntime, Clock]:
-    """Construct chains, store, relayer and runtime on a fresh virtual clock."""
+    """Construct chains, store, relayer and runtime on a fresh virtual clock.
+
+    Both chains hold a bridge escrow so either direction can deliver out of
+    the box; ordinary users on A are funded from DEFAULT_ACCOUNTS.
+    """
     cfg = _config_from_env()
     clock = Clock()
-    chain_a = SimulatedChain("A", genesis_balances=dict(DEFAULT_ACCOUNTS), clock=clock)
+    chain_a = SimulatedChain(
+        "A",
+        genesis_balances={**dict(DEFAULT_ACCOUNTS), ESCROW_ACCOUNT: cfg.escrow_initial},
+        clock=clock,
+    )
     chain_b = SimulatedChain(
         "B", genesis_balances={ESCROW_ACCOUNT: cfg.escrow_initial}, clock=clock
     )

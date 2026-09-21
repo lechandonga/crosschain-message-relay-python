@@ -4,12 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from relay.errors import (
-    RetriesExhaustedError,
-    TargetRejectedError,
-    TimeoutError_,
-    TransientFailureError,
-)
+from relay.errors import RetriesExhaustedError, TargetRejectedError
 from relay.models import MessageStatus
 
 

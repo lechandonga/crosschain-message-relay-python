@@ -99,6 +99,7 @@ async def test_out_of_order_gap_waits_then_expires(world, make_message, log_case
         await world["relayer"].relay_once(gap.message_id)
     log_case("gap_expired", {"age": ">=window"}, ei2.value.reason)
     assert not ei2.value.retryable
+    assert world["store"].get(gap.message_id).status is MessageStatus.EXPIRED
 
 
 async def test_ordered_nonces_deliver_in_sequence(world, make_message):

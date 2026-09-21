@@ -34,7 +34,7 @@ async def client():
 
 
 async def test_health_and_chains(client):
-    c, *_ = client
+    c = client[0]
     assert (await c.get("/health")).json()["status"] == "ok"
     chains = (await c.get("/chains")).json()
     assert chains["A"]["total_supply"] == 1000
@@ -42,7 +42,7 @@ async def test_health_and_chains(client):
 
 
 async def test_full_lifecycle_and_duplicate_code(client):
-    c, relayer, a, b, clock = client
+    c = client[0]
     r = await c.post("/chains/A/submit", json={
         "chain": "A", "channel": "ch", "sender": "alice",
         "receiver": "bob", "amount": 100, "nonce": 1})
@@ -58,7 +58,7 @@ async def test_full_lifecycle_and_duplicate_code(client):
 
 
 async def test_not_finalized_code(client):
-    c, *_ = client
+    c = client[0]
     r = await c.post("/chains/A/submit", json={
         "chain": "A", "channel": "ch", "sender": "alice",
         "receiver": "bob", "amount": 10, "nonce": 1})
@@ -72,7 +72,7 @@ async def test_not_finalized_code(client):
 
 async def test_forged_proof_not_directly_postable_but_status_queryable(client):
     # the API auto-signs; query endpoints still expose full state
-    c, relayer, a, b, clock = client
+    c, relayer, a, _b, _clock = client
     r = await c.post("/chains/A/submit", json={
         "chain": "A", "channel": "ch", "sender": "alice",
         "receiver": "bob", "amount": 10, "nonce": 1})
@@ -90,7 +90,7 @@ async def test_forged_proof_not_directly_postable_but_status_queryable(client):
 
 
 async def test_runtime_stats_and_backpressure_endpoint(client):
-    c, relayer, a, b, clock = client
+    c = client[0]
     for n in range(1, 4):
         await c.post("/chains/A/submit", json={
             "chain": "A", "channel": "ch", "sender": "alice",
@@ -104,7 +104,7 @@ async def test_runtime_stats_and_backpressure_endpoint(client):
 
 
 async def test_reorg_endpoint_reconciles(client):
-    c, relayer, a, b, clock = client
+    c = client[0]
     r = await c.post("/chains/A/submit", json={
         "chain": "A", "channel": "ch", "sender": "alice",
         "receiver": "bob", "amount": 100, "nonce": 1})
@@ -122,7 +122,7 @@ async def test_reorg_endpoint_reconciles(client):
 
 
 async def test_bad_submit_body_rejected(client):
-    c, *_ = client
+    c = client[0]
     r = await c.post("/chains/A/submit", json={
         "chain": "A", "channel": "ch", "sender": "alice",
         "receiver": "bob", "amount": -5, "nonce": 1})

@@ -56,7 +56,7 @@ async def test_reorg_is_reproducible(world, make_message):
     world["B"].mine(1)
     before = world["store"].get(msg.message_id).status
     world["B"].reorg_to(2)
-    affected1 = world["relayer"].reconcile()
+    world["relayer"].reconcile()
     status1 = world["store"].get(msg.message_id).status
     note1 = world["store"].get(msg.message_id).note
     # reconcile is idempotent: running again changes nothing

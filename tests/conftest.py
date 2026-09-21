@@ -10,8 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import pytest_asyncio
 import pytest
+import pytest_asyncio
 
 from relay.chain import ESCROW_ACCOUNT, SimulatedChain
 from relay.clock import Clock, VirtualTimeEventLoop
@@ -51,7 +51,12 @@ async def world():
     clock = running._vclock
     cfg = build_config()
     chain_a = SimulatedChain(
-        "A", genesis_balances={"alice": 1000, "bob": 1000, "carol": 1000}, clock=clock
+        "A",
+        genesis_balances={
+            "alice": 1000, "bob": 1000, "carol": 1000,
+            ESCROW_ACCOUNT: cfg.escrow_initial,
+        },
+        clock=clock,
     )
     chain_b = SimulatedChain(
         "B", genesis_balances={ESCROW_ACCOUNT: cfg.escrow_initial}, clock=clock

@@ -107,14 +107,14 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
             if scheduled:
                 nxt = scheduled[0].when()
                 if nxt > self.time():
-                    self._vclock.advance_to(int(round(nxt * 1000)))
+                    self._vclock.advance_to(round(nxt * 1000))
                 continue  # now the timer is due -> handled on next pass
             # no ready, no timers: wait for real IO without blocking forever
             event_list = self._selector.select(0.05)
             self._process_events(event_list)
             return
 
-def make_virtual_loop(clock: "Clock | None" = None) -> "VirtualTimeEventLoop":
+def make_virtual_loop(clock: Clock | None = None) -> VirtualTimeEventLoop:
     """Factory used by tests (via pytest-asyncio loop factories) and main."""
     return VirtualTimeEventLoop(clock if clock is not None else Clock())
 

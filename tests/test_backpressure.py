@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from relay.chain import ESCROW_ACCOUNT, SimulatedChain
 from relay.config import build_config
 from relay.errors import BackpressureError
@@ -81,7 +79,7 @@ async def test_backpressure_when_full_then_drain(log_case):
 
 
 async def test_duplicate_submit_coalesced():
-    relayer, runtime, a, b, mids, cfg = _bounded(count=2)
+    relayer, runtime, _a, b, mids, _cfg = _bounded(count=2)
     await runtime.start()
     gate, _ = _gate(relayer)
     assert await runtime.submit(mids[0]) is True

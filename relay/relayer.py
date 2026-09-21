@@ -18,10 +18,8 @@ from .config import RelayConfig
 from .crypto import sign_message
 from .errors import (
     DuplicateDeliveryError,
-    NotFinalizedError,
     RelayError,
     ReorgRollbackError,
-    ReplayError,
     RetriesExhaustedError,
     StaleNonceError,
     TargetRejectedError,
@@ -153,11 +151,21 @@ class Relayer:
 
             head_height = source.head().height
             next_nonce = self.store.next_nonce(message.source_chain, message.channel)
-            self.validator.check_order(
-                message,
-                channel_next_nonce=next_nonce,
-                source_head_height=head_height,
-            )
+            try:
+                self.validator.check_order(
+                    message,
+                    channel_next_nonce=next_nonce,
+                    source_head_height=head_height,
+                )
+            except StaleNonceError as exc:
+                if not exc.retryable:
+                    self.store.transition(
+                        message_id,
+                        MessageStatus.EXPIRED,
+                        now=self.clock.now(),
+                        note="ordering gap never filled within stale window",
+                    )
+                raise
 
             if record.status is not MessageStatus.FINALIZED:
                 self.store.transition(

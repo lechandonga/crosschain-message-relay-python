@@ -20,7 +20,6 @@ from collections import defaultdict
 from .clock import Clock
 from .errors import (
     DuplicateDeliveryError,
-    RelayError,
     TargetRejectedError,
     TimeoutError_,
     TransientFailureError,

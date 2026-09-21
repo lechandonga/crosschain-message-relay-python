@@ -17,7 +17,6 @@ class RelayConfig:
     stale_window: int = 8            # nonce expiry window (source blocks)
     queue_capacity: int = 256        # bounded pending-work queue
     max_inflight: int = 8            # concurrent relay workers
-    tick_interval_ms: int = 25       # simulated clock advance per tick
     escrow_initial: int = 1_000_000  # target bridge escrow endowment
 
     # (field, predicate, human description) — every failure lists its reason
@@ -30,11 +29,10 @@ class RelayConfig:
         ("stale_window", lambda v: isinstance(v, int) and v >= 1, "integer >= 1"),
         ("queue_capacity", lambda v: isinstance(v, int) and v >= 1, "integer >= 1"),
         ("max_inflight", lambda v: isinstance(v, int) and v >= 1, "integer >= 1"),
-        ("tick_interval_ms", lambda v: isinstance(v, int) and v >= 1, "integer >= 1"),
         ("escrow_initial", lambda v: isinstance(v, int) and v >= 0, "integer >= 0"),
     )
 
-    def validate(self) -> "RelayConfig":
+    def validate(self) -> RelayConfig:
         problems: list[str] = []
         for name, ok, desc in self._RULES:  # type: ignore[attr-defined]
             value = getattr(self, name)
