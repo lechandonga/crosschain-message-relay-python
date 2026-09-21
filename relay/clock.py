@@ -16,7 +16,6 @@ a normal loop, which is what keeps a served process alive when idle.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import heapq
 
 
@@ -115,13 +114,9 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
             self._process_events(event_list)
             return
 
-class VirtualTimeEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-    def __init__(self, clock: Clock) -> None:
-        super().__init__()
-        self._vclock = clock
-
-    def new_event_loop(self) -> asyncio.AbstractEventLoop:  # type: ignore[override]
-        return VirtualTimeEventLoop(self._vclock)
+def make_virtual_loop(clock: "Clock | None" = None) -> "VirtualTimeEventLoop":
+    """Factory used by tests (via pytest-asyncio loop factories) and main."""
+    return VirtualTimeEventLoop(clock if clock is not None else Clock())
 
 
 def run_virtual(main_coro_factory, *, start_ms: int = 0):
@@ -136,8 +131,3 @@ def run_virtual(main_coro_factory, *, start_ms: int = 0):
         return loop.run_until_complete(main_coro_factory(clock))
     finally:
         loop.close()
-
-
-_context: contextvars.ContextVar[Clock | None] = contextvars.ContextVar(
-    "virtual_clock", default=None
-)
