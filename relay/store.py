@@ -40,7 +40,10 @@ class RelayStore:
                 note=note,
             )
             self._records[message.message_id] = record
-            # first time we see a channel, prime its cursor at this nonce
+            # First time we see a channel, prime its cursor at this nonce.
+            # Observations never move an existing cursor (delivery/failure
+            # advance it; a smaller nonce observed later is a replay and a
+            # larger nonce is an order gap -- neither rewrites the cursor).
             key = self._channel_key(message.source_chain, message.channel)
             self._next_nonce.setdefault(key, message.nonce)
             return record

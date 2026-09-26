@@ -53,6 +53,10 @@ class Relayer:
         self.validator = ProofValidator(config.finality_depth, config.stale_window)
         self._locks_guard = threading.Lock()
         self._delivery_locks: dict[str, asyncio.Lock] = {}
+        # serialises reconcile() passes against each other; together with the
+        # per-message locks this makes reconciliation vs delivery equivalent
+        # to some serial execution
+        self._reconcile_lock = asyncio.Lock()
 
     def chains(self) -> tuple[SimulatedChain, SimulatedChain]:
         return self.chain_a, self.chain_b
@@ -134,12 +138,10 @@ class Relayer:
 
             # the message may have disappeared from the source canonical chain
             if not source.has_message(message_id) or not source.is_message_canonical(message_id):
-                self.store.transition(
-                    message_id,
-                    MessageStatus.SOURCE_REORGED,
-                    now=self.clock.now(),
-                    note="source inclusion not canonical at relay time",
-                )
+                # run the full convergence rule for this record (refund
+                # reclaim if a target delivery somehow stands, otherwise the
+                # chain-level refund already made) under this message lock
+                self._reconcile_one(record)
                 raise ReorgRollbackError(f"{message_id} no longer canonical on source")
 
             message = source.get_message(message_id)
@@ -159,12 +161,7 @@ class Relayer:
                 )
             except StaleNonceError as exc:
                 if not exc.retryable:
-                    self.store.transition(
-                        message_id,
-                        MessageStatus.EXPIRED,
-                        now=self.clock.now(),
-                        note="ordering gap never filled within stale window",
-                    )
+                    self._settle_expired(message)
                 raise
 
             if record.status is not MessageStatus.FINALIZED:
@@ -177,22 +174,20 @@ class Relayer:
 
             # ---- delivery with bounded backoff retries -------------------
             try:
-                delivered_height = await self._deliver_with_retry(message, target)
-            except RetriesExhaustedError:
-                self.store.transition(
-                    message_id,
-                    MessageStatus.FAILED,
-                    now=self.clock.now(),
-                    note="retries_exhausted",
+                delivered_height = await self._deliver_with_retry(message, source, target)
+            except RetriesExhaustedError as exc:
+                self._settle_permanent_failure(
+                    message, "retries_exhausted", str(exc)
                 )
                 raise
-            except TargetRejectedError:
-                self.store.transition(
-                    message_id,
-                    MessageStatus.FAILED,
-                    now=self.clock.now(),
-                    note="target_rejected",
+            except TargetRejectedError as exc:
+                self._settle_permanent_failure(
+                    message, "target_rejected", str(exc)
                 )
+                raise
+            except ReorgRollbackError:
+                # a reorg interleaved with backoff; converge this record
+                self._reconcile_one(self.store.get(message_id))
                 raise
 
             # success: cursor + record move together under the message lock
@@ -214,14 +209,26 @@ class Relayer:
             )
             return MessageStatus.DELIVERED
 
-    async def _deliver_with_retry(self, message: Message, target: SimulatedChain) -> int:
+    async def _deliver_with_retry(
+        self, message: Message, source: SimulatedChain, target: SimulatedChain
+    ) -> int:
         """Attempt delivery with exponential backoff; never double-debits.
 
         target.deliver applies balances atomically and raises all retryable
-        faults before moving funds, so a retry after a fault is safe.
+        faults before moving funds, so a retry after a fault is safe. The
+        source inclusion is re-checked under the message lock at the top of
+        every attempt -- including after each backoff sleep, during which a
+        reorg+reconciliation could otherwise have settled the message -- so a
+        retry can never apply a target delivery for a message the source side
+        has already rolled back.
         """
         cfg = self.config
         for attempt in range(1, cfg.max_attempts + 1):
+            if not source.is_message_canonical(message.message_id):
+                raise ReorgRollbackError(
+                    f"{message.message_id} source inclusion reverted before delivery attempt "
+                    f"{attempt}"
+                )
             started = self.clock.now_ms()
             try:
                 height = target.deliver(message)
@@ -272,83 +279,273 @@ class Relayer:
         # unreachable: loop either returns or raises
         raise RuntimeError("retry loop fell through")  # pragma: no cover
 
-    # ---- reorg reconciliation -------------------------------------------
-    def reconcile(self) -> list[str]:
-        """Rebuild records and channel cursors against canonical chain state.
+    def _settle_expired(self, message: Message) -> None:
+        """Terminal disposition for a nonce that aged past the stale window.
 
-        Deterministic rules after a reorg of any depth:
-          * source inclusion gone -> SOURCE_REORGED (terminal). If the target
-            delivery still stands it is *not* silently undone: the record
-            keeps delivered_height and the note explains the disposition.
-          * source stands, target delivery gone -> TARGET_REORGED,
-            redeliverable; relay_once re-applies it at most once.
-          * both stand -> DELIVERED unchanged.
-        Channel cursors are recomputed from scratch so no nonce is skipped or
-        reused. Returns affected message ids in store order.
+        Same fund/ordering convergence as permanent failure: refund the
+        source-locked funds to the sender and consume the channel nonce so
+        later messages keep flowing. Distinct status (EXPIRED) and reason
+        (stale_nonce, retryable=False) are preserved for callers.
         """
-        affected: list[str] = []
-        for record in self.store.all_records():
-            source = self.chain_a if record.source_chain == "A" else self.chain_b
-            target = self.chain_b if record.target_chain == "B" else self.chain_a
-            source_ok = source.is_message_canonical(record.message_id)
-            target_ok = target.is_delivery_canonical(record.message_id)
+        source = self.source_for(message)
+        settle_height = source.refund_locked(
+            message.message_id, sender=message.sender, amount=message.amount
+        )
+        self.store.advance_nonce(message.source_chain, message.channel, message.nonce)
+        self.store.transition(
+            message.message_id,
+            MessageStatus.EXPIRED,
+            now=self.clock.now(),
+            note=(
+                "ordering gap never filled within stale window; locked funds "
+                f"refunded to sender {message.sender} on {source.chain_id} at "
+                f"settlement height {settle_height}; channel nonce consumed; "
+                "not redeliverable"
+            ),
+        )
+        log.info(
+            "expired id=%s refund_height=%s", message.message_id, settle_height
+        )
 
-            new_status: MessageStatus | None = None
-            note: str | None = None
+    def _settle_permanent_failure(self, message: Message, reason: str, detail: str) -> None:
+        """Give a permanently failed message a complete, terminal disposition.
 
-            if not source_ok:
-                if record.status is not MessageStatus.SOURCE_REORGED:
-                    new_status = MessageStatus.SOURCE_REORGED
-                    note = (
-                        "source inclusion reverted; "
-                        + (
-                            f"target delivery at {record.delivered_height} stands"
-                            if target_ok
-                            else "no canonical target delivery"
-                        )
-                    )
-            elif not target_ok and record.status is MessageStatus.DELIVERED:
-                new_status = MessageStatus.TARGET_REORGED
-                note = "target delivery reverted; message redeliverable"
-            elif source_ok and target_ok and record.status is MessageStatus.TARGET_REORGED:
-                new_status = MessageStatus.DELIVERED
-                note = "delivery canonical again"
+        Runs under the caller's per-message lock and does three things
+        atomically with respect to other relay work on this message:
+          1. move the source-locked funds back to the sender (definite home,
+             funds never stay suspended);
+          2. mark the record FAILED with the distinct terminal reason;
+          3. advance the channel cursor past this nonce, so one message's
+             permanent failure blocks nothing behind it.
+        Idempotent: a canonical refund settlement already in place is reused
+        and never moves funds twice.
+        """
+        source = self.source_for(message)
+        settle_height = source.refund_locked(
+            message.message_id, sender=message.sender, amount=message.amount
+        )
+        self.store.advance_nonce(message.source_chain, message.channel, message.nonce)
+        note = (
+            f"{reason}; locked funds refunded to sender {message.sender} "
+            f"on {source.chain_id} at settlement height {settle_height}; "
+            f"channel cursor advanced past nonce {message.nonce}; not redeliverable"
+        )
+        self.store.transition(
+            message.message_id,
+            MessageStatus.FAILED,
+            now=self.clock.now(),
+            note=note,
+        )
+        log.info(
+            "permanent_failure id=%s reason=%s refund_height=%s detail=%s",
+            message.message_id,
+            reason,
+            settle_height,
+            detail,
+        )
 
-            if new_status is not None:
-                self.store.transition(
-                    record.message_id,
-                    new_status,
-                    now=self.clock.now(),
-                    note=note or "",
+    # ---- reorg reconciliation -------------------------------------------
+    async def reconcile(self) -> list[str]:
+        """Rebuild records, settlements and channel cursors against canonical state.
+
+        This is the single convergence point after any reorg (of any depth,
+        at any time). It is idempotent: a second pass with no chain change
+        does nothing and returns []. Rules:
+
+          * source inclusion gone, record was delivered and the target
+            delivery still stands -> SOURCE_REORGED, and the automatic source
+            refund is reclaimed into escrow exactly once. The target delivery
+            is *kept* (never silently undone/overwritten), so the message has
+            exactly one funds effect and sender+receiver holdings across both
+            chains match the pre-reorg total. Not redeliverable.
+          * source inclusion gone, no canonical target delivery ->
+            SOURCE_REORGED, refund already made by the chain, not redeliverable.
+          * source stands, target delivery gone (record delivered/
+            target_reorged) -> TARGET_REORGED, redeliverable; relay_once
+            re-applies it at most once.
+          * permanent failure / expiry: the locked funds are refunded to the
+            sender (idempotent) and the nonce is consumed, so a later reorg
+            removing the refund block re-locks the funds and reconciliation
+            refunds again — funds have a definite home and never hang.
+          * both stand -> DELIVERED unchanged.
+
+        Locking: one global reconcile guard plus every affected message's
+        per-message lock (taken in store order), so a pass interleaving with
+        deliveries is equivalent to some serial execution and can never move
+        funds twice or leave a half-updated record.
+        """
+        async with self._reconcile_lock:
+            records = self.store.all_records()
+            locks = [self._lock_for(r.message_id) for r in records]
+            for lock in locks:
+                await lock.acquire()
+            try:
+                affected: list[str] = []
+                for record in records:
+                    changed, settled = self._reconcile_one(record)
+                    if changed or settled:
+                        affected.append(record.message_id)
+                self._rebuild_cursors()
+            finally:
+                for lock in reversed(locks):
+                    lock.release()
+            return affected
+
+    def _reconcile_one(self, record) -> tuple[bool, bool]:
+        """Reconcile a single record; caller holds its message lock.
+
+        Returns ``(status_changed, settlement_issued)`` so the caller can
+        report every message whose record or funds disposition converged.
+        """
+        source = self.chain_a if record.source_chain == "A" else self.chain_b
+        target = self.chain_b if record.target_chain == "B" else self.chain_a
+        mid = record.message_id
+        source_ok = source.is_message_canonical(mid)
+        target_ok = target.is_delivery_canonical(mid)
+
+        # ---- terminal permanence on the source side ---------------------
+        if not source_ok:
+            if target_ok and record.delivered_height is not None:
+                # Delivered on target, source inclusion reverted: the chain
+                # auto-refunded the sender. Reclaim that refund so the
+                # transfer keeps exactly one economic effect (target keeps).
+                already = source.settlement(mid)
+                h = source.reclaim_refund(
+                    mid,
+                    sender=self._sender_of(record, source),
+                    amount=self._amount_of(record, source),
                 )
-                affected.append(record.message_id)
-                log.info("reconcile id=%s -> %s (%s)", record.message_id, new_status.value, note)
+                settled = already is None
+                if record.status is not MessageStatus.SOURCE_REORGED:
+                    self.store.transition(
+                        mid,
+                        MessageStatus.SOURCE_REORGED,
+                        now=self.clock.now(),
+                        note=(
+                            f"source inclusion reverted after target delivery at "
+                            f"height {record.delivered_height}; target delivery "
+                            f"retained; auto refund reclaimed into {source.chain_id} "
+                            f"escrow at settlement height {h}; not redeliverable"
+                        ),
+                    )
+                    log.info(
+                        "reconcile id=%s -> source_reorged (delivery kept, "
+                        "refund reclaimed at %s)",
+                        mid, h,
+                    )
+                    return True, settled
+                # status already terminal; a fresh reclaim still counts
+                return False, settled
+            if record.status is not MessageStatus.SOURCE_REORGED:
+                self.store.transition(
+                    mid,
+                    MessageStatus.SOURCE_REORGED,
+                    now=self.clock.now(),
+                    note=(
+                        "source inclusion reverted (no canonical target delivery); "
+                        "locked funds refunded to sender by source reorg; "
+                        "not redeliverable"
+                    ),
+                )
+                log.info("reconcile id=%s -> source_reorged (no target delivery)", mid)
+                return True, False
+            return False, False
 
-        self._rebuild_cursors()
-        return affected
+        # ---- source stands ----------------------------------------------
+        if not target_ok and record.status is MessageStatus.DELIVERED:
+            self.store.transition(
+                mid,
+                MessageStatus.TARGET_REORGED,
+                now=self.clock.now(),
+                note="target delivery reverted; funds restored to target escrow; redeliverable",
+            )
+            log.info("reconcile id=%s -> target_reorged (redeliverable)", mid)
+            return True, False
+
+        if target_ok and record.status is MessageStatus.TARGET_REORGED:
+            self.store.transition(
+                mid,
+                MessageStatus.DELIVERED,
+                now=self.clock.now(),
+                note="delivery canonical again",
+            )
+            log.info("reconcile id=%s -> delivered (canonical again)", mid)
+            return True, False
+
+        # ---- permanent terminal records: keep funds settled --------------
+        if record.status in (MessageStatus.FAILED, MessageStatus.EXPIRED):
+            if not source.is_settlement_canonical(mid):
+                # a reorg removed the refund block (funds re-locked); refund
+                # again so locked money never stays suspended
+                h = source.refund_locked(
+                    mid,
+                    sender=self._sender_of(record, source),
+                    amount=self._amount_of(record, source),
+                )
+                base = (
+                    "target rejection/retries exhausted"
+                    if record.status is MessageStatus.FAILED
+                    else "ordering window expired"
+                )
+                self.store.transition(
+                    mid,
+                    record.status,
+                    now=self.clock.now(),
+                    note=(
+                        f"{base}; locked funds refunded to sender "
+                        f"{self._sender_of(record, source)} on {source.chain_id} at "
+                        f"settlement height {h}; channel nonce consumed; "
+                        f"not redeliverable"
+                    ),
+                )
+                log.info(
+                    "reconcile id=%s refund re-issued at %s after settlement reorg",
+                    mid, h,
+                )
+                return True, True
+        return False, False
+
+    # helpers: the source chain retains the Message object even after the
+    # inclusion is no longer canonical, so sender/amount stay available for
+    # settlement bookkeeping
+    def _sender_of(self, record, source: SimulatedChain) -> str:
+        return source.get_message(record.message_id).sender
+
+    def _amount_of(self, record, source: SimulatedChain) -> int:
+        return source.get_message(record.message_id).amount
+
 
     def _rebuild_cursors(self) -> None:
         """Deterministically recompute per-channel next nonce from records.
 
-        Cursor = 1 + largest n such that every nonce up to n is delivered
-        canonically; messages whose source vanished are ignored for ordering.
+        A nonce is *consumed* when its message reached a terminal disposition
+        on a still-canonical source -- delivered, permanently failed or
+        expired -- so that one failed/expired message never blocks the rest
+        of its channel; or when its source inclusion vanished yet its target
+        delivery stands (settled post-reorg). Cursor = 1 + the longest run of
+        consumed nonces from the channel's minimum observed nonce.
         """
-        delivered_nonces: dict[tuple[str, str], list[int]] = {}
+        consumed_nonces: dict[tuple[str, str], list[int]] = {}
         all_nonces: dict[tuple[str, str], list[int]] = {}
         for record in self.store.all_records():
             source = self.chain_a if record.source_chain == "A" else self.chain_b
+            target = self.chain_b if record.target_chain == "B" else self.chain_a
             key = (record.source_chain, record.channel)
             all_nonces.setdefault(key, []).append(record.nonce)
-            if (
-                source.is_message_canonical(record.message_id)
-                and record.status is MessageStatus.DELIVERED
+            source_ok = source.is_message_canonical(record.message_id)
+            if source_ok and record.status in (
+                MessageStatus.DELIVERED,
+                MessageStatus.FAILED,
+                MessageStatus.EXPIRED,
             ):
-                delivered_nonces.setdefault(key, []).append(record.nonce)
+                consumed_nonces.setdefault(key, []).append(record.nonce)
+            elif not source_ok and target.is_delivery_canonical(record.message_id):
+                consumed_nonces.setdefault(key, []).append(record.nonce)
 
         for key, nonces in all_nonces.items():
             minimum = min(nonces)
-            delivered = set(delivered_nonces.get(key, ()))
+            consumed = set(consumed_nonces.get(key, ()))
             cursor = minimum
-            while cursor in delivered:
+            while cursor in consumed:
                 cursor += 1
             self.store.reset_nonce(key[0], key[1], cursor)

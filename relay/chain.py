@@ -6,6 +6,13 @@ Effective ledger model (per direction):
   * source reorg      : removed sends are reversed -> sender refunded
   * target reorg      : removed deliveries are reversed (escrow restored),
                         so the message becomes redeliverable exactly once
+  * relay settlement  : two relay-issued, block-recorded, reorg-reversible
+    dispositions give locked money a definite terminal home:
+      - ``refund_locked``  : escrow -> sender after permanent failure/expiry
+      - ``reclaim_refund`` : sender -> escrow after a delivered message's
+                             source inclusion is reorged (the chain already
+                             auto-refunded; this takes that refund back so a
+                             delivered message keeps exactly one effect)
 
 Each chain therefore conserves its own token supply across every operation.
 """
@@ -27,6 +34,13 @@ from .errors import (
 from .models import Block, Message
 
 ESCROW_ACCOUNT = "escrow"
+
+# Relay-driven settlement kinds. Unlike submissions/deliveries these are
+# issued by the relay layer to give locked funds a deterministic terminal
+# disposition. Each is keyed by the originating message id, mines a block,
+# is reversible by a later reorg and idempotent under reconciliation.
+SETTLE_REFUND_LOCKED = "refund_locked"   # escrow -> sender after permanent failure
+SETTLE_RECLAIM_REFUND = "reclaim_refund"  # sender -> escrow after delivered-then-reorged
 
 
 class _Block(Block):
@@ -88,6 +102,11 @@ class SimulatedChain:
         self._delivery_info: dict[str, tuple[str, int]] = {}
         # set of delivered ids currently included canonically (target chain)
         self._delivered_canonical: dict[str, bool] = {}
+        # relay-driven settlements keyed by the originating message id:
+        # id -> {"kind", "from", "to", "amount", "height"} plus a canonical
+        # marker so a reorg can reverse them exactly like deliveries.
+        self._settlements: dict[str, dict[str, object]] = {}
+        self._settlement_canonical: dict[str, bool] = {}
         # pending submissions for the next block
         self._pending: list[Message] = []
         # fault injection
@@ -306,6 +325,87 @@ class SimulatedChain:
                 if self._delivered_canonical.get(mid, False)
             }
 
+    # ---- relay-driven settlement ----------------------------------------
+    def _apply_settlement(
+        self, message_id: str, kind: str, *, sender: str, amount: int
+    ) -> int:
+        """Mine a block carrying a relay settlement and move funds atomically.
+
+        Idempotent per message id + kind: a canonical settlement already in
+        place returns its height unchanged, so repeated reconciliation can
+        never move funds twice. ``kind`` selects the direction of the move.
+        """
+        existing = self._settlements.get(message_id)
+        if (
+            existing is not None
+            and existing["kind"] == kind
+            and self._settlement_canonical.get(message_id, False)
+        ):
+            return int(existing["height"])
+        if existing is not None and existing["kind"] != kind:
+            # two dispositions for one message must never coexist
+            raise TargetRejectedError(
+                f"cannot settle {message_id} as {kind}: "
+                f"already settled as {existing['kind']}"
+            )
+        parent = self._blocks[-1]
+        block = _Block(
+            parent.height + 1, parent.hash, self.clock.now(), [message_id]
+        )
+        if kind == SETTLE_REFUND_LOCKED:
+            # escrow -> sender: locked funds get a definite home after failure
+            self._debit(ESCROW_ACCOUNT, amount)
+            self._credit(sender, amount)
+        elif kind == SETTLE_RECLAIM_REFUND:
+            # sender -> escrow: take back the automatic reorg refund so a
+            # message already delivered on target keeps exactly one effect
+            self._debit(sender, amount)
+            self._credit(ESCROW_ACCOUNT, amount)
+        else:  # pragma: no cover - defensive
+            raise ValueError(f"unknown settlement kind {kind!r}")
+        self._blocks.append(block)
+        self._settlements[message_id] = {
+            "kind": kind,
+            "sender": sender,
+            "amount": amount,
+            "height": block.height,
+        }
+        self._settlement_canonical[message_id] = True
+        return block.height
+
+    def refund_locked(self, message_id: str, *, sender: str, amount: int) -> int:
+        """Refund source-locked funds to ``sender`` after a permanent failure."""
+        with self._lock:
+            return self._apply_settlement(
+                message_id, SETTLE_REFUND_LOCKED, sender=sender, amount=amount
+            )
+
+    def reclaim_refund(self, message_id: str, *, sender: str, amount: int) -> int:
+        """Reclaim the automatic source-reorg refund from ``sender`` to escrow."""
+        with self._lock:
+            return self._apply_settlement(
+                message_id, SETTLE_RECLAIM_REFUND, sender=sender, amount=amount
+            )
+
+    def settlement(self, message_id: str) -> dict[str, object] | None:
+        with self._lock:
+            entry = self._settlements.get(message_id)
+            if entry is None or not self._settlement_canonical.get(message_id, False):
+                return None
+            return dict(entry)
+
+    def canonical_settlements(self) -> dict[str, dict[str, object]]:
+        with self._lock:
+            return {
+                mid: dict(entry)
+                for mid, entry in self._settlements.items()
+                if self._settlement_canonical.get(mid, False)
+            }
+
+    def is_settlement_canonical(self, message_id: str) -> bool:
+        with self._lock:
+            return self._settlement_canonical.get(message_id, False)
+
     # ---- reorg -----------------------------------------------------------
     def reorg_to(self, depth: int, *, empty_fork: bool = True) -> list[Block]:
         """Replace the last ``depth`` blocks with a fresh fork.
@@ -338,6 +438,12 @@ class SimulatedChain:
                 for mid in b.message_ids
                 if self._delivered_canonical.get(mid, False)
             ]
+            removed_settlements = [
+                mid
+                for b in removed_blocks
+                for mid in b.message_ids
+                if self._settlement_canonical.get(mid, False)
+            ]
 
             # ---- roll back balances & markers ----------------------------
             for mid in sorted(removed_messages):
@@ -356,6 +462,22 @@ class SimulatedChain:
                     self._balances[receiver] -= amount
                     self._balances[ESCROW_ACCOUNT] += amount
                 self._delivered_canonical[mid] = False
+            for mid in sorted(removed_settlements):
+                entry = self._settlements[mid]
+                sender = str(entry["sender"])
+                amount = int(entry["amount"])
+                kind = str(entry["kind"])
+                if kind == SETTLE_REFUND_LOCKED:
+                    # undo the failure refund: sender -> escrow (re-lock)
+                    if self._balances.get(sender, 0) >= amount:
+                        self._balances[sender] -= amount
+                        self._balances[ESCROW_ACCOUNT] += amount
+                elif kind == SETTLE_RECLAIM_REFUND:
+                    # undo the reclaim: escrow -> sender (refund stands again)
+                    if self._balances.get(ESCROW_ACCOUNT, 0) >= amount:
+                        self._balances[ESCROW_ACCOUNT] -= amount
+                        self._balances[sender] = self._balances.get(sender, 0) + amount
+                self._settlement_canonical[mid] = False
 
             # ---- build replacement fork -----------------------------------
             self._blocks = list(kept)

@@ -115,6 +115,16 @@ def _chain_snapshot(chain: SimulatedChain) -> dict[str, Any]:
             {"message_id": mid, "height": h}
             for mid, h in sorted(chain.delivered_heights().items())
         ],
+        "settlements": [
+            {
+                "message_id": mid,
+                "kind": str(entry["kind"]),
+                "sender": entry["sender"],
+                "amount": entry["amount"],
+                "height": entry["height"],
+            }
+            for mid, entry in sorted(chain.canonical_settlements().items())
+        ],
     }
 
 
@@ -198,10 +208,10 @@ def create_app(
         }
 
     @app.post("/reorg")
-    def reorg(body: ReorgBody) -> dict[str, Any]:
+    async def reorg(body: ReorgBody) -> dict[str, Any]:
         chain = _chain(body.chain)
         blocks = chain.reorg_to(body.depth)
-        affected = relayer.reconcile()
+        affected = await relayer.reconcile()
         return {
             "ok": True,
             "chain": body.chain,
@@ -227,8 +237,8 @@ def create_app(
         return {"ok": True, "newly_observed": newly}
 
     @app.post("/reconcile")
-    def reconcile() -> dict[str, Any]:
-        affected = relayer.reconcile()
+    async def reconcile() -> dict[str, Any]:
+        affected = await relayer.reconcile()
         return {"ok": True, "affected": affected}
 
     @app.get("/messages")
