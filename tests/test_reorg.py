@@ -34,12 +34,12 @@ async def test_target_reorg_redelivers_exactly_once(world, make_message, log_cas
 
 
 async def test_source_reorg_marks_terminal_and_refunds(world, make_message, log_case):
+    # not yet delivered: source reorg refunds the sender (single disposition)
     msg = make_message(world, amount=100, nonce=1)
-    await world["relayer"].relay_once(msg.message_id)
     head = world["A"].head().height
-    world["A"].reorg_to(head)  # remove the inclusion
+    world["A"].reorg_to(head)  # remove the inclusion before any delivery
     affected = world["relayer"].reconcile()
-    log_case("source_reorg", {"depth": head}, "SOURCE_REORGED")
+    log_case("source_reorg_before_delivery", {"depth": head}, "SOURCE_REORGED+refund")
     assert msg.message_id in affected
     rec = world["store"].get(msg.message_id)
     assert rec.status is MessageStatus.SOURCE_REORGED
@@ -47,6 +47,42 @@ async def test_source_reorg_marks_terminal_and_refunds(world, make_message, log_
         await world["relayer"].relay_once(msg.message_id)
     # escrow refunded deterministically; chain supply conserved
     assert world["A"].balance_of("alice") == 1000
+    assert world["A"].send_disposition(msg.message_id) == "refunded"
+
+
+async def test_source_reorg_after_delivery_keeps_single_effect(world, make_message, log_case):
+    # delivered first, *then* the source inclusion is reorged: the delivery
+    # stands, so the sender must NOT also be refunded -- one funds effect total
+    msg = make_message(world, amount=100, nonce=1)
+    await world["relayer"].relay_once(msg.message_id)
+    books_before = (
+        world["A"].balance_of("alice"),
+        world["A"].balance_of("escrow"),
+        world["B"].balance_of("bob"),
+        world["B"].balance_of("escrow"),
+    )
+    head = world["A"].head().height
+    world["A"].reorg_to(head)  # remove the inclusion
+    affected = world["relayer"].reconcile()
+    log_case("source_reorg_after_delivery", {"depth": head}, "SOURCE_REORGED+settled")
+    assert msg.message_id in affected
+    rec = world["store"].get(msg.message_id)
+    assert rec.status is MessageStatus.SOURCE_REORGED
+    assert rec.delivered_height is not None  # history preserved, not erased
+    assert "stands" in rec.note
+    with pytest.raises(ReorgRollbackError):
+        await world["relayer"].relay_once(msg.message_id)
+    # books identical to pre-reorg: no refund on top of the delivery
+    assert (
+        world["A"].balance_of("alice"),
+        world["A"].balance_of("escrow"),
+        world["B"].balance_of("bob"),
+        world["B"].balance_of("escrow"),
+    ) == books_before
+    assert world["A"].send_disposition(msg.message_id) == "settled"
+    # reconcile is idempotent: no extra funds movement, no record change
+    assert world["relayer"].reconcile() == []
+    assert world["A"].balance_of("alice") == books_before[0]
 
 
 async def test_reorg_is_reproducible(world, make_message):

@@ -134,11 +134,17 @@ class Relayer:
 
             # the message may have disappeared from the source canonical chain
             if not source.has_message(message_id) or not source.is_message_canonical(message_id):
+                note = "source inclusion not canonical at relay time"
+                if target.is_delivery_canonical(message_id):
+                    # the delivery stands: retain the escrow backing so the
+                    # message keeps exactly one funds effect (see reconcile)
+                    source.ensure_send_settled(message_id)
+                    note += "; target delivery stands, escrow lock retained"
                 self.store.transition(
                     message_id,
                     MessageStatus.SOURCE_REORGED,
                     now=self.clock.now(),
-                    note="source inclusion not canonical at relay time",
+                    note=note,
                 )
                 raise ReorgRollbackError(f"{message_id} no longer canonical on source")
 
@@ -159,11 +165,12 @@ class Relayer:
                 )
             except StaleNonceError as exc:
                 if not exc.retryable:
+                    funds = self._release_locked_funds(message, source)
                     self.store.transition(
                         message_id,
                         MessageStatus.EXPIRED,
                         now=self.clock.now(),
-                        note="ordering gap never filled within stale window",
+                        note=f"ordering gap never filled within stale window; {funds}",
                     )
                 raise
 
@@ -179,23 +186,16 @@ class Relayer:
             try:
                 delivered_height = await self._deliver_with_retry(message, target)
             except RetriesExhaustedError:
-                self.store.transition(
-                    message_id,
-                    MessageStatus.FAILED,
-                    now=self.clock.now(),
-                    note="retries_exhausted",
-                )
+                self._fail_terminally(message, source, reason="retries_exhausted")
                 raise
             except TargetRejectedError:
-                self.store.transition(
-                    message_id,
-                    MessageStatus.FAILED,
-                    now=self.clock.now(),
-                    note="target_rejected",
-                )
+                self._fail_terminally(message, source, reason="target_rejected")
                 raise
 
-            # success: cursor + record move together under the message lock
+            # success: cursor + record move together under the message lock,
+            # and the source send is marked settled so a later source reorg
+            # retains the escrow backing instead of refunding the sender
+            source.confirm_external_delivery(message_id)
             self.store.advance_nonce(message.source_chain, message.channel, message.nonce)
             self.store.transition(
                 message_id,
@@ -213,6 +213,41 @@ class Relayer:
                 delivered_height,
             )
             return MessageStatus.DELIVERED
+
+    # ---- terminal settlement ----------------------------------------------
+    def _release_locked_funds(self, message: Message, source: SimulatedChain) -> str:
+        """Give a terminal message's locked escrow a deterministic home.
+
+        The sender is refunded exactly once across any interleaving of
+        failure handling, reorgs and reconciliations. The returned phrase is
+        appended to the record note so the disposition stays queryable.
+        """
+        if source.refund_failed_send(message.message_id):
+            log.info(
+                "refund id=%s sender=%s amount=%s (terminal)",
+                message.message_id,
+                message.sender,
+                message.amount,
+            )
+            return f"refunded {message.amount} to {message.sender}"
+        return f"funds {source.send_disposition(message.message_id)}"
+
+    def _fail_terminally(self, message: Message, source: SimulatedChain, *, reason: str) -> None:
+        """Settle a permanently failed message: funds home + channel unblocked.
+
+        A permanent failure only fails *this* message: its locked escrow is
+        refunded (exactly once) and the channel cursor consumes its nonce, so
+        later messages on the same channel keep flowing instead of stalling
+        behind a terminal record.
+        """
+        funds = self._release_locked_funds(message, source)
+        self.store.advance_nonce(message.source_chain, message.channel, message.nonce)
+        self.store.transition(
+            message.message_id,
+            MessageStatus.FAILED,
+            now=self.clock.now(),
+            note=f"{reason}; {funds}",
+        )
 
     async def _deliver_with_retry(self, message: Message, target: SimulatedChain) -> int:
         """Attempt delivery with exponential backoff; never double-debits.
@@ -279,12 +314,16 @@ class Relayer:
         Deterministic rules after a reorg of any depth:
           * source inclusion gone -> SOURCE_REORGED (terminal). If the target
             delivery still stands it is *not* silently undone: the record
-            keeps delivered_height and the note explains the disposition.
+            keeps delivered_height, the source escrow lock is retained (or
+            clawed back exactly once if the reorg had already refunded), and
+            the note explains the disposition -- the message keeps exactly
+            one funds effect across both chains.
           * source stands, target delivery gone -> TARGET_REORGED,
             redeliverable; relay_once re-applies it at most once.
           * both stand -> DELIVERED unchanged.
         Channel cursors are recomputed from scratch so no nonce is skipped or
-        reused. Returns affected message ids in store order.
+        reused. Returns affected message ids in store order. Idempotent:
+        running it again moves no funds and changes no record.
         """
         affected: list[str] = []
         for record in self.store.all_records():
@@ -297,15 +336,35 @@ class Relayer:
             note: str | None = None
 
             if not source_ok:
+                compensated = False
+                delivered_h = record.delivered_height
+                if target_ok:
+                    # the delivery stands: the source escrow lock must back it
+                    # exactly once -- retained across the reorg, or clawed back
+                    # if the reorg refunded before the delivery was known
+                    compensated = source.ensure_send_settled(record.message_id)
+                    if delivered_h is None:
+                        delivered_h = target.delivered_heights().get(record.message_id)
                 if record.status is not MessageStatus.SOURCE_REORGED:
                     new_status = MessageStatus.SOURCE_REORGED
-                    note = (
-                        "source inclusion reverted; "
-                        + (
-                            f"target delivery at {record.delivered_height} stands"
-                            if target_ok
-                            else "no canonical target delivery"
+                    if target_ok:
+                        note = (
+                            f"source inclusion reverted; target delivery at "
+                            f"{delivered_h} stands; "
+                            + (
+                                "sender refund clawed back to escrow (compensated)"
+                                if compensated
+                                else "escrow lock retained"
+                            )
                         )
+                    else:
+                        note = "source inclusion reverted; no canonical target delivery"
+                if delivered_h is not None and record.delivered_height is None:
+                    self.store.transition(
+                        record.message_id,
+                        record.status,
+                        now=self.clock.now(),
+                        delivered_height=delivered_h,
                     )
             elif not target_ok and record.status is MessageStatus.DELIVERED:
                 new_status = MessageStatus.TARGET_REORGED
@@ -330,25 +389,32 @@ class Relayer:
     def _rebuild_cursors(self) -> None:
         """Deterministically recompute per-channel next nonce from records.
 
-        Cursor = 1 + largest n such that every nonce up to n is delivered
-        canonically; messages whose source vanished are ignored for ordering.
+        Cursor = 1 + largest n such that every nonce up to n is *consumed*:
+        delivered canonically, or terminally settled (failed / expired) --
+        a permanent failure must not wedge the channel behind it. Messages
+        whose source inclusion vanished (source_reorged) are *not* consumed:
+        their nonce is free for a resubmission.
         """
-        delivered_nonces: dict[tuple[str, str], list[int]] = {}
+        consumed_nonces: dict[tuple[str, str], list[int]] = {}
         all_nonces: dict[tuple[str, str], list[int]] = {}
         for record in self.store.all_records():
             source = self.chain_a if record.source_chain == "A" else self.chain_b
             key = (record.source_chain, record.channel)
             all_nonces.setdefault(key, []).append(record.nonce)
-            if (
-                source.is_message_canonical(record.message_id)
-                and record.status is MessageStatus.DELIVERED
-            ):
-                delivered_nonces.setdefault(key, []).append(record.nonce)
+            consumed = (
+                record.status in (MessageStatus.FAILED, MessageStatus.EXPIRED)
+                or (
+                    source.is_message_canonical(record.message_id)
+                    and record.status is MessageStatus.DELIVERED
+                )
+            )
+            if consumed:
+                consumed_nonces.setdefault(key, []).append(record.nonce)
 
         for key, nonces in all_nonces.items():
             minimum = min(nonces)
-            delivered = set(delivered_nonces.get(key, ()))
+            consumed = set(consumed_nonces.get(key, ()))
             cursor = minimum
-            while cursor in delivered:
+            while cursor in consumed:
                 cursor += 1
             self.store.reset_nonce(key[0], key[1], cursor)

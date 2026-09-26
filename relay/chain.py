@@ -3,11 +3,21 @@
 Effective ledger model (per direction):
   * source ``submit`` : sender -amount, ``escrow`` +amount   (locked)
   * target ``deliver``: ``escrow`` -amount, receiver +amount
-  * source reorg      : removed sends are reversed -> sender refunded
+  * source reorg      : removed sends are reversed -> sender refunded,
+                        *unless* the send is already settled (delivered on
+                        the target) or was already refunded; then the escrow
+                        lock is retained / left untouched, so a reorg can
+                        never create a second funds effect for one message
   * target reorg      : removed deliveries are reversed (escrow restored),
                         so the message becomes redeliverable exactly once
+  * permanent failure : the still-locked send is refunded exactly once
+                        (``refund_failed_send``), giving locked funds a
+                        deterministic home
 
-Each chain therefore conserves its own token supply across every operation.
+Each send therefore ends in exactly one disposition -- ``locked`` (in
+flight), ``settled`` (delivery stands, escrow keeps the backing) or
+``refunded`` (escrow released back to the sender) -- and each chain
+conserves its own token supply across every operation.
 """
 
 from __future__ import annotations
@@ -88,6 +98,11 @@ class SimulatedChain:
         self._delivery_info: dict[str, tuple[str, int]] = {}
         # set of delivered ids currently included canonically (target chain)
         self._delivered_canonical: dict[str, bool] = {}
+        # per-send funds disposition (source side). A send's escrow lock is
+        # released (refunded) or retained (settled) exactly once, no matter
+        # how reorgs, failures and reconciliations interleave.
+        self._settled_sends: set[str] = set()    # delivery stands; keep locked
+        self._refunded_sends: set[str] = set()   # escrow already released
         # pending submissions for the next block
         self._pending: list[Message] = []
         # fault injection
@@ -306,6 +321,72 @@ class SimulatedChain:
                 if self._delivered_canonical.get(mid, False)
             }
 
+    # ---- source-send funds disposition -----------------------------------
+    def confirm_external_delivery(self, message_id: str) -> None:
+        """Mark a source send as settled: its delivery stands on the target.
+
+        From this point the escrow lock backs the target payout, so a later
+        source reorg must *retain* the lock instead of refunding the sender.
+        Idempotent; also repairs the narrow window where a reorg refunded
+        the send between target delivery and this confirmation.
+        """
+        with self._lock:
+            self._ensure_settled_locked(message_id)
+
+    def refund_failed_send(self, message_id: str) -> bool:
+        """Release a still-locked send back to its sender (permanent failure).
+
+        Returns True exactly once per send -- the call that actually moves
+        escrow -> sender. No-op (False) when the send is not canonical (a
+        reorg already owns its disposition), already refunded, or settled.
+        """
+        with self._lock:
+            if not self._message_canonical.get(message_id, False):
+                return False
+            if message_id in self._refunded_sends or message_id in self._settled_sends:
+                return False
+            m = self._messages[message_id]
+            self._debit(ESCROW_ACCOUNT, m.amount)
+            self._credit(m.sender, m.amount)
+            self._refunded_sends.add(message_id)
+            return True
+
+    def ensure_send_settled(self, message_id: str) -> bool:
+        """Guarantee the escrow lock of a delivered send is retained.
+
+        Used by reconciliation when the source inclusion is gone but the
+        target delivery stands. If an earlier reorg already refunded the
+        sender (the reorg ran before the delivery was known), the refund is
+        clawed back -- sender -> escrow -- so the message keeps exactly one
+        funds effect. Returns True when this call moved funds (compensation),
+        False when the lock was already retained. Idempotent.
+        """
+        with self._lock:
+            return self._ensure_settled_locked(message_id)
+
+    def _ensure_settled_locked(self, message_id: str) -> bool:
+        if message_id in self._settled_sends:
+            return False
+        self._settled_sends.add(message_id)
+        if message_id in self._refunded_sends:
+            self._refunded_sends.discard(message_id)
+            m = self._messages[message_id]
+            self._debit(m.sender, m.amount)
+            self._credit(ESCROW_ACCOUNT, m.amount)
+            return True
+        return False
+
+    def send_disposition(self, message_id: str) -> str:
+        """Current funds disposition of a source send (observability)."""
+        with self._lock:
+            if message_id in self._settled_sends:
+                return "settled"
+            if message_id in self._refunded_sends:
+                return "refunded"
+            if self._message_canonical.get(message_id, False):
+                return "locked"
+            return "unknown"
+
     # ---- reorg -----------------------------------------------------------
     def reorg_to(self, depth: int, *, empty_fork: bool = True) -> list[Block]:
         """Replace the last ``depth`` blocks with a fresh fork.
@@ -342,9 +423,17 @@ class SimulatedChain:
             # ---- roll back balances & markers ----------------------------
             for mid in sorted(removed_messages):
                 m = self._messages[mid]
-                # reverse source lock: escrow -> sender
-                self._balances[ESCROW_ACCOUNT] -= m.amount
-                self._balances[m.sender] = self._balances.get(m.sender, 0) + m.amount
+                # reverse source lock: escrow -> sender -- but only if the
+                # send is still merely locked. A settled send (delivery
+                # stands on the target) keeps its escrow backing; an already
+                # refunded send (permanent failure) must not be refunded
+                # twice. Either way each send yields exactly one funds effect.
+                if mid in self._settled_sends or mid in self._refunded_sends:
+                    pass
+                else:
+                    self._balances[ESCROW_ACCOUNT] -= m.amount
+                    self._balances[m.sender] = self._balances.get(m.sender, 0) + m.amount
+                    self._refunded_sends.add(mid)
                 self._message_canonical[mid] = False
             for mid in sorted(removed_deliveries):
                 receiver, amount = self._delivery_info[mid]
