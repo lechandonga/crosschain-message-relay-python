@@ -19,6 +19,7 @@ uv run pytest -q -k concurrency     # 同消息并发串行一致性
 uv run pytest -q -k conservation    # 双向/多次/失败转移守恒
 uv run pytest -q -k backpressure    # 有界队列与限流
 uv run pytest -q -k settlement      # 终态结算：单次资金效果/通道活性/交错一致
+uv run pytest -q -k interleaving    # 交错时序：退避中重组/双重回滚退款/并发对账
 ```
 
 测试使用虚拟时间事件循环：重试退避、超时**零真实耗时**但虚拟时长精确，
@@ -107,6 +108,25 @@ curl -s -X POST localhost:8077/faults -H 'Content-Type: application/json' \
 # C. 交错/并发：同一消息并发投递、重试退避中执行 reconcile、
 #    重组后多个处理者竞争——均有自动化用例（pytest -k settlement），
 #    日志打印输入与判定依据，可逐条对照。
+
+# D. 双重回滚后资金归宿（已投递 -> 目标回滚 -> 源也回滚）
+#    依次：submit -> mine 3 -> scan -> relay/A-msg-1（delivered），然后：
+curl -s -X POST localhost:8077/reorg -H 'Content-Type: application/json' \
+  -d '{"chain":"B","depth":1}'   # 目标投递被回滚 -> target_reorged
+curl -s -X POST localhost:8077/reorg -H 'Content-Type: application/json' \
+  -d '{"chain":"A","depth":3}'   # 源包含也被移除 -> source_reorged
+#    GET /messages/A-msg-1：status=source_reorged，delivered_height 保留，
+#    note 写明 “no canonical target delivery; refunded <amount> to alice”；
+#    GET /chains 可见 alice 已收回退款、escrow(A) 回到初始值（资金不悬空）；
+#    再 POST /relay/A-msg-1 -> 410 reorg_rollback；
+#    再 POST /reconcile -> {"affected": []}（幂等，无第二次退款）。
+#    交换两条 /reorg 的顺序（先源后目标）结论相同。
+
+# E. 退避重试等待中源侧重组并对账：注入 transient 1 次后立即 relay，
+#    在退避窗口内执行上面的源链 /reorg；等待中的那次尝试不会投递，
+#    记录稳定保持 source_reorged 终态与说明。该时序由
+#    tests/test_interleaving.py 在虚拟时钟下确定性复现
+#    （pytest -q -k interleaving，日志含输入与判定依据）。
 ```
 
 ## 判定结论在哪里看

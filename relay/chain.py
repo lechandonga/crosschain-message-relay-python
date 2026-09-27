@@ -13,6 +13,10 @@ Effective ledger model (per direction):
   * permanent failure : the still-locked send is refunded exactly once
                         (``refund_failed_send``), giving locked funds a
                         deterministic home
+  * orphaned lock     : a settled send whose target delivery later reverts
+                        while the source inclusion is also gone is refunded
+                        exactly once (``release_orphaned_send``) -- the lock
+                        backs nothing and must not hang in escrow forever
 
 Each send therefore ends in exactly one disposition -- ``locked`` (in
 flight), ``settled`` (delivery stands, escrow keeps the backing) or
@@ -375,6 +379,27 @@ class SimulatedChain:
             self._credit(ESCROW_ACCOUNT, m.amount)
             return True
         return False
+
+    def release_orphaned_send(self, message_id: str) -> bool:
+        """Refund a settled send whose target delivery no longer stands.
+
+        Used by reconciliation when *both* the source inclusion and the
+        target delivery are gone: the escrow lock backs nothing any more, so
+        it is released back to the sender exactly once instead of hanging in
+        escrow forever. Returns True when this call moved funds. No-op
+        (False) for sends that are not settled -- a merely locked send is
+        owned by the source-reorg refund path, and an already refunded send
+        must not be refunded twice.
+        """
+        with self._lock:
+            if message_id not in self._settled_sends:
+                return False
+            self._settled_sends.discard(message_id)
+            self._refunded_sends.add(message_id)
+            m = self._messages[message_id]
+            self._debit(ESCROW_ACCOUNT, m.amount)
+            self._credit(m.sender, m.amount)
+            return True
 
     def send_disposition(self, message_id: str) -> str:
         """Current funds disposition of a source send (observability)."""
