@@ -7,12 +7,21 @@ Effective ledger model (per direction):
                         *unless* the send is already settled (delivered on
                         the target) or was already refunded; then the escrow
                         lock is retained / left untouched, so a reorg can
-                        never create a second funds effect for one message
+                        never create a second funds effect for one message.
+                        A settled lock whose target delivery later vanishes
+                        is released once by ``release_unbacked_send`` (see
+                        below) rather than kept suspended forever.
   * target reorg      : removed deliveries are reversed (escrow restored),
                         so the message becomes redeliverable exactly once
   * permanent failure : the still-locked send is refunded exactly once
                         (``refund_failed_send``), giving locked funds a
                         deterministic home
+  * delivery rolled back after the source inclusion was also removed
+                        (``release_unbacked_send``): an orphaned *settled*
+                        lock -- one whose target payout no longer stands --
+                        is returned to the sender exactly once, so funds
+                        never stay suspended behind a non-redeliverable
+                        message
 
 Each send therefore ends in exactly one disposition -- ``locked`` (in
 flight), ``settled`` (delivery stands, escrow keeps the backing) or
@@ -103,6 +112,10 @@ class SimulatedChain:
         # how reorgs, failures and reconciliations interleave.
         self._settled_sends: set[str] = set()    # delivery stands; keep locked
         self._refunded_sends: set[str] = set()   # escrow already released
+        # sends whose premature reorg refund had to be clawed back into
+        # escrow once the standing target delivery became known; retained so
+        # reconciliation reports a stable disposition on every later run
+        self._compensated_sends: set[str] = set()
         # pending submissions for the next block
         self._pending: list[Message] = []
         # fault injection
@@ -351,6 +364,47 @@ class SimulatedChain:
             self._refunded_sends.add(message_id)
             return True
 
+    def release_unbacked_send(self, message_id: str) -> tuple[bool, str]:
+        """Give a non-canonical source send with NO standing target delivery a home.
+
+        Disposition matrix when the source inclusion is gone and the target
+        side has no canonical delivery (the message is therefore not
+        redeliverable):
+
+          * send merely refunded (the reorg itself, or an earlier terminal
+            settlement, already moved escrow -> sender) -> no further move;
+          * send marked ``settled`` but the delivery that justified the lock
+            was rolled back on the target -> the orphaned lock is returned
+            escrow -> sender exactly once, so funds can never stay suspended
+            behind a message that can neither stand nor be redelivered.
+
+        Returns ``(funds_moved, disposition)``; idempotent. Conservation is
+        preserved: the escrow lock exists in exactly the settled case.
+        """
+        with self._lock:
+            if self._message_canonical.get(message_id, False):
+                # caller contract: only removed inclusions are settled here
+                return False, self.send_disposition(message_id)
+            m = self._messages[message_id]
+            if message_id in self._refunded_sends:
+                return False, "refunded"
+            if message_id in self._settled_sends:
+                # the delivery backing this lock no longer stands on target:
+                # return the orphaned lock to the sender once
+                self._settled_sends.discard(message_id)
+                self._balances[ESCROW_ACCOUNT] -= m.amount
+                self._balances[m.sender] = self._balances.get(m.sender, 0) + m.amount
+                self._refunded_sends.add(message_id)
+                return True, "refunded"
+            # defensive: non-canonical yet neither marked nor refunded -- the
+            # lock must still sit in escrow, release it deterministically
+            if self._balances.get(ESCROW_ACCOUNT, 0) >= m.amount:
+                self._balances[ESCROW_ACCOUNT] -= m.amount
+                self._balances[m.sender] = self._balances.get(m.sender, 0) + m.amount
+                self._refunded_sends.add(message_id)
+                return True, "refunded"
+            return False, "unknown"
+
     def ensure_send_settled(self, message_id: str) -> bool:
         """Guarantee the escrow lock of a delivered send is retained.
 
@@ -364,12 +418,18 @@ class SimulatedChain:
         with self._lock:
             return self._ensure_settled_locked(message_id)
 
+    def was_send_compensated(self, message_id: str) -> bool:
+        """Whether a premature refund for this send was ever clawed back."""
+        with self._lock:
+            return message_id in self._compensated_sends
+
     def _ensure_settled_locked(self, message_id: str) -> bool:
         if message_id in self._settled_sends:
             return False
         self._settled_sends.add(message_id)
         if message_id in self._refunded_sends:
             self._refunded_sends.discard(message_id)
+            self._compensated_sends.add(message_id)
             m = self._messages[message_id]
             self._debit(m.sender, m.amount)
             self._credit(ESCROW_ACCOUNT, m.amount)
